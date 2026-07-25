@@ -11,7 +11,11 @@ from pyrogram import Client
 # ==========================================
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
-SESSION_STRING = os.environ.get("SESSION_STRING", "")
+# 找到原本的這行：
+# SESSION_STRING = os.environ.get("SESSION_STRING", "")
+
+# 🌟 加上 .strip() 改成這樣：
+SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
 TARGET_GROUP_ID = int(os.environ.get("TARGET_GROUP_ID", 0))
 
 # ==========================================
