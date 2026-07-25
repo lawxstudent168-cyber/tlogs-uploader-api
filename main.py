@@ -35,7 +35,7 @@ app.add_middleware(
 # 3. 初始化 Pyrogram (Telegram 客戶端)
 # ==========================================
 tg_client = Client(
-    "render_session",
+    SESSION_STRING,
     api_id=API_ID,
     api_hash=API_HASH,
     session_string=SESSION_STRING
