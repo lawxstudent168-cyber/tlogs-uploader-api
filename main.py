@@ -34,11 +34,11 @@ app.add_middleware(
 # ==========================================
 # 3. 初始化 Pyrogram (Telegram 客戶端)
 # ==========================================
+# ✅ 請改成這樣：直接把 SESSION_STRING 當作第一個參數
 tg_client = Client(
-    SESSION_STRING,
+    SESSION_STRING,  
     api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING
+    api_hash=API_HASH
 )
 
 # 在 FastAPI 啟動與關閉時，連動啟動/關閉 Telegram 客戶端
