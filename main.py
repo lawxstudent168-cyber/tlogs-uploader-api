@@ -1,171 +1,139 @@
-import hashlib
 import os
-import tempfile
-import urllib.parse
-
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+import uuid
+import shutil
+from fastapi import FastAPI, File, UploadFile, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+
+# 🌟 改用 Telethon 核心
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import DocumentAttributeFilename, InputMessagesFilterDocument
 
-
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "").strip()
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
-TARGET_GROUP_ID = int(os.environ.get("TARGET_GROUP_ID", "0"))
+TARGET_GROUP_ID = int(os.environ.get("TARGET_GROUP_ID", 0))
 
-app = FastAPI(title="SHJHS Telegram Evidence API")
+app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-client = (
-    TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    if API_ID and API_HASH and SESSION_STRING
-    else None
-)
-
-
-async def ensure_connected() -> None:
-    if client is None or not TARGET_GROUP_ID:
-        raise HTTPException(status_code=503, detail="Telegram 環境變數尚未完整設定")
-    if not client.is_connected():
-        await client.connect()
-    if not await client.is_user_authorized():
-        raise HTTPException(status_code=503, detail="Telegram Session 無效或已過期")
-
+# ==========================================
+# 初始化 Telethon 客戶端 (吃您的原本 Session)
+# ==========================================
+tg_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 @app.on_event("startup")
-async def startup_event() -> None:
-    try:
-        await ensure_connected()
-        print("Telegram client connected")
-    except HTTPException as exc:
-        print(f"Telegram client unavailable: {exc.detail}")
-
+async def startup_event():
+    await tg_client.connect()
+    # 檢查 session 是否有效
+    if not await tg_client.is_user_authorized():
+        print("🛑 警告：Telegram Session 無效或已過期")
+    else:
+        print("✅ Telegram 客戶端已連線 (Telethon)")
 
 @app.on_event("shutdown")
-async def shutdown_event() -> None:
-    if client is not None and client.is_connected():
-        await client.disconnect()
+async def shutdown_event():
+    await tg_client.disconnect()
+    print("🛑 Telegram 客戶端已離線")
 
+upload_tasks = {}
+
+# ==========================================
+# Telethon 背景上傳邏輯
+# ==========================================
+async def process_and_upload_to_tg(task_id: str, file_path: str, filename: str):
+    upload_tasks[task_id]["status"] = "processing"
+    try:
+        # 使用 Telethon 發送檔案
+        message = await tg_client.send_file(
+            TARGET_GROUP_ID,
+            file_path,
+            caption=filename
+        )
+        
+        # 組合 Telegram 跳轉連結
+        chat_id_str = str(TARGET_GROUP_ID).replace("-100", "")
+        tg_link = f"https://t.me/c/{chat_id_str}/{message.id}"
+        
+        upload_tasks[task_id]["telegram_link"] = tg_link
+        upload_tasks[task_id]["message_id"] = message.id
+        upload_tasks[task_id]["status"] = "completed"
+        
+    except Exception as e:
+        print(f"[{task_id}] 上傳 Telegram 失敗: {e}")
+        upload_tasks[task_id]["status"] = "failed"
+        
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
 @app.get("/")
-async def read_root():
-    return {"status": "ok", "service": "SHJHS Telegram Evidence API"}
-
-
-@app.get("/health")
-async def health():
-    await ensure_connected()
-    return {"status": "healthy", "telegram_connected": True}
-
+async def root():
+    return {"status": "ok", "message": "API 伺服器運作中"}
 
 @app.post("/upload/")
-async def upload_recording(
-    file: UploadFile = File(...),
-    topic_id: int = Form(...),
-    caption: str | None = Form(None),
-):
-    await ensure_connected()
+async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    task_id = str(uuid.uuid4())
+    upload_tasks[task_id] = {
+        "status": "pending",
+        "telegram_link": None,
+        "message_id": None
+    }
+    
+    temp_file_path = f"/tmp/{task_id}_{file.filename}"
+    with open(temp_file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    background_tasks.add_task(process_and_upload_to_tg, task_id, temp_file_path, file.filename)
+    return {"success": True, "task_id": task_id}
 
-    original_name = file.filename or "recording"
-    suffix = os.path.splitext(original_name)[1]
-    temp_path = ""
+@app.get("/status/{task_id}")
+async def get_status(task_id: str):
+    task = upload_tasks.get(task_id)
+    if not task:
+        return {"status": "not_found"}
+    return task
 
+# ==========================================
+# Telethon 串流下載邏輯
+# ==========================================
+@app.get("/download/{message_id}")
+async def stream_download(message_id: int):
     try:
-        sha256_hash = hashlib.sha256()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as buffer:
-            temp_path = buffer.name
-            while chunk := await file.read(1024 * 1024):
-                buffer.write(chunk)
-                sha256_hash.update(chunk)
+        # Telethon 抓取單一訊息
+        message = await tg_client.get_messages(TARGET_GROUP_ID, ids=message_id)
+        
+        if not message or not message.media:
+            raise HTTPException(status_code=404, detail="找不到附加檔案")
 
-        message = await client.send_file(
-            TARGET_GROUP_ID,
-            file=temp_path,
-            reply_to=topic_id,
-            caption=caption or f"📂 證據檔案：{original_name}",
-            force_document=True,
-            attributes=[DocumentAttributeFilename(original_name)],
-        )
-
-        chat_id = str(TARGET_GROUP_ID).removeprefix("-100")
-        return {
-            "success": True,
-            "filename": original_name,
-            "telegram_link": f"https://t.me/c/{chat_id}/{message.id}",
-            "file_hash": sha256_hash.hexdigest(),
-            "message_id": message.id,
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    finally:
-        await file.close()
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
-@app.get("/search")
-async def search_group_files(query: str = "", limit: int = 20):
-    await ensure_connected()
-    safe_limit = min(max(limit, 1), 100)
-
-    try:
-        results = []
-        async for message in client.iter_messages(
-            TARGET_GROUP_ID,
-            search=query,
-            filter=InputMessagesFilterDocument,
-            limit=safe_limit,
-        ):
-            if not message.document:
-                continue
-
-            filename = "未知檔案"
-            for attribute in message.document.attributes:
-                if isinstance(attribute, DocumentAttributeFilename):
-                    filename = attribute.file_name
+        # 嘗試解析原始檔名
+        file_name = "downloaded_evidence"
+        if hasattr(message.media, 'document'):
+            for attr in message.media.document.attributes:
+                if hasattr(attr, 'file_name'):
+                    file_name = attr.file_name
                     break
 
-            results.append(
-                {
-                    "id": message.id,
-                    "filename": filename,
-                    "size_mb": round(message.document.size / (1024 * 1024), 2),
-                    "caption": message.text or "",
-                    "date": message.date.strftime("%Y/%m/%d %H:%M"),
-                }
-            )
+        async def file_streamer():
+            # Telethon 的分塊下載產生器
+            async for chunk in tg_client.iter_download(message.media):
+                yield chunk
 
-        return {"success": True, "data": results}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@app.get("/download/{message_id}")
-async def download_file(message_id: int):
-    await ensure_connected()
-    message = await client.get_messages(TARGET_GROUP_ID, ids=message_id)
-    if not message or not message.file:
-        raise HTTPException(status_code=404, detail="找不到該檔案")
-
-    async def file_streamer():
-        async for chunk in client.iter_download(message.media, chunk_size=1024 * 1024):
-            yield bytes(chunk)
-
-    filename = message.file.name or "telegram_evidence"
-    encoded_filename = urllib.parse.quote(filename)
-    return StreamingResponse(
-        file_streamer(),
-        media_type="application/octet-stream",
-        headers={"Content-Disposition": f"attachment; filename*=utf-8''{encoded_filename}"},
-    )
+        return StreamingResponse(
+            file_streamer(),
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{file_name}"'
+            }
+        )
+        
+    except Exception as e:
+        print(f"串流下載失敗: {e}")
+        raise HTTPException(status_code=500, detail="無法取得串流資源")
